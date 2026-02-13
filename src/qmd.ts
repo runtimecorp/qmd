@@ -65,7 +65,19 @@ import {
   createStore,
   getDefaultDbPath,
 } from "./store.js";
-import { disposeDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "./llm.js";
+import {
+  type EmbeddingResult,
+  getDefaultEmbeddingLLM,
+  isUsingOpenAI,
+  disposeDefaultLlamaCpp,
+  setEmbeddingConfig,
+  withLLMSession,
+  pullModels,
+  DEFAULT_EMBED_MODEL_URI,
+  DEFAULT_GENERATE_MODEL_URI,
+  DEFAULT_RERANK_MODEL_URI,
+  DEFAULT_MODEL_CACHE_DIR,
+} from "./llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -81,6 +93,7 @@ import {
   setGlobalContext,
   listAllContexts,
   setConfigIndexName,
+  getEmbeddingConfig as getEmbeddingConfigFromYaml,
 } from "./collections.js";
 
 // Enable production mode - allows using default database path
@@ -1547,14 +1560,18 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
   if (multiChunkDocs > 0) {
     console.log(`${c.dim}${multiChunkDocs} documents split into multiple chunks${c.reset}`);
   }
-  console.log(`${c.dim}Model: ${model}${c.reset}\n`);
+  const useOpenAI = isUsingOpenAI();
+  const openAIModel = getEmbeddingConfigFromYaml().openai?.model || "text-embedding-3-small";
+  const displayModel = useOpenAI ? openAIModel : model;
+  console.log(`${c.dim}Model: ${displayModel}${useOpenAI ? " (OpenAI)" : ""}${c.reset}\n`);
 
   // Hide cursor during embedding
   cursor.hide();
 
-  // Wrap all LLM embedding operations in a session for lifecycle management
-  // Use 30 minute timeout for large collections
-  await withLLMSession(async (session) => {
+  const doEmbedding = async (
+    embedFn: (text: string) => Promise<EmbeddingResult | null>,
+    embedBatchFn: (texts: string[]) => Promise<(EmbeddingResult | null)[]>
+  ) => {
     // Get embedding dimensions from first chunk
     progress.indeterminate();
     const firstChunk = allChunks[0];
@@ -1562,7 +1579,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       throw new Error("No chunks available to embed");
     }
     const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-    const firstResult = await session.embed(firstText);
+    const firstResult = await embedFn(firstText);
     if (!firstResult) {
       throw new Error("Failed to get embedding dimensions from first chunk");
     }
@@ -1571,9 +1588,8 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
     const startTime = Date.now();
 
-    // Batch embedding for better throughput
-    // Process in batches of 32 to balance memory usage and efficiency
-    const BATCH_SIZE = 32;
+    // OpenAI supports larger batches than local llama-cpp.
+    const BATCH_SIZE = useOpenAI ? 100 : 32;
 
     for (let batchStart = 0; batchStart < allChunks.length; batchStart += BATCH_SIZE) {
       const batchEnd = Math.min(batchStart + BATCH_SIZE, allChunks.length);
@@ -1584,7 +1600,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
 
       try {
         // Batch embed all texts at once
-        const embeddings = await session.embedBatch(texts);
+        const embeddings = await embedBatchFn(texts);
 
         // Insert each embedding
         for (let i = 0; i < batch.length; i++) {
@@ -1592,7 +1608,7 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
           const embedding = embeddings[i];
 
           if (embedding) {
-            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
+            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), displayModel, now);
             chunksEmbedded++;
           } else {
             errors++;
@@ -1605,9 +1621,9 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
         for (const chunk of batch) {
           try {
             const text = formatDocForEmbedding(chunk.text, chunk.title);
-            const result = await session.embed(text);
+            const result = await embedFn(text);
             if (result) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), displayModel, now);
               chunksEmbedded++;
             } else {
               errors++;
@@ -1635,6 +1651,10 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
       const errStr = errors > 0 ? ` ${c.yellow}${errors} err${c.reset}` : "";
 
       process.stderr.write(`\r${c.cyan}${bar}${c.reset} ${c.bold}${percentStr}%${c.reset} ${c.dim}${chunksEmbedded}/${totalChunks}${c.reset}${errStr} ${c.dim}${throughput} ETA ${eta}${c.reset}   `);
+
+      if (useOpenAI && batchStart + BATCH_SIZE < allChunks.length) {
+        await new Promise(resolve => setTimeout(resolve, 150));
+      }
     }
 
     progress.clear();
@@ -1647,7 +1667,23 @@ async function vectorIndex(model: string = DEFAULT_EMBED_MODEL, force: boolean =
     if (errors > 0) {
       console.log(`${c.yellow}⚠ ${errors} chunks failed${c.reset}`);
     }
-  }, { maxDuration: 30 * 60 * 1000, name: 'embed-command' });
+  };
+
+  if (useOpenAI) {
+    const embeddingLLM = getDefaultEmbeddingLLM();
+    await doEmbedding(
+      (text) => embeddingLLM.embed(text),
+      (texts) => embeddingLLM.embedBatch(texts)
+    );
+  } else {
+    // Wrap local embedding in a session for lifecycle safety.
+    await withLLMSession(async (session) => {
+      await doEmbedding(
+        (text) => session.embed(text),
+        (texts) => session.embedBatch(texts)
+      );
+    }, { maxDuration: 30 * 60 * 1000, name: "embed-command" });
+  }
 
   closeDb();
 }
@@ -2162,6 +2198,19 @@ if (import.meta.main) {
   if (!cli.command || cli.values.help) {
     showHelp();
     process.exit(cli.values.help ? 0 : 1);
+  }
+
+  // Load embedding provider config from YAML (with env var override).
+  const embeddingYamlConfig = getEmbeddingConfigFromYaml();
+  const useOpenAI = process.env.QMD_OPENAI === "1" || embeddingYamlConfig.provider === "openai";
+  if (useOpenAI) {
+    setEmbeddingConfig({
+      provider: "openai",
+      openai: {
+        apiKey: embeddingYamlConfig.openai?.api_key || process.env.OPENAI_API_KEY,
+        embedModel: embeddingYamlConfig.openai?.model,
+      },
+    });
   }
 
   switch (cli.command) {

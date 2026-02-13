@@ -17,6 +17,7 @@ import {
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { OpenAIEmbedding, type OpenAIConfig } from "./openai-llm.js";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -290,6 +291,11 @@ export interface LLM {
    * Get embeddings for text
    */
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
+
+  /**
+   * Get embeddings for multiple texts in a batch
+   */
+  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
 
   /**
    * Generate text completion
@@ -1205,4 +1211,48 @@ export async function disposeDefaultLlamaCpp(): Promise<void> {
     await defaultLlamaCpp.dispose();
     defaultLlamaCpp = null;
   }
+}
+
+// =============================================================================
+// OpenAI Embedding Support
+// =============================================================================
+
+export type EmbeddingProvider = "local" | "openai";
+
+export type EmbeddingConfig = {
+  provider: EmbeddingProvider;
+  openai?: OpenAIConfig;
+};
+
+// Default embedding config: use local llama-cpp
+let embeddingConfig: EmbeddingConfig = { provider: "local" };
+let openAIEmbedding: OpenAIEmbedding | null = null;
+
+/**
+ * Set the embedding configuration. Call before using embeddings.
+ */
+export function setEmbeddingConfig(config: EmbeddingConfig): void {
+  embeddingConfig = config;
+  // Reset OpenAI instance if config changes
+  openAIEmbedding = null;
+}
+
+/**
+ * Check if using OpenAI for embeddings/query expansion/reranking.
+ */
+export function isUsingOpenAI(): boolean {
+  return embeddingConfig.provider === "openai";
+}
+
+/**
+ * Get the provider-aware embedding/query/rerank client.
+ */
+export function getDefaultEmbeddingLLM(): LLM {
+  if (embeddingConfig.provider === "openai") {
+    if (!openAIEmbedding) {
+      openAIEmbedding = new OpenAIEmbedding(embeddingConfig.openai);
+    }
+    return openAIEmbedding;
+  }
+  return getDefaultLlamaCpp();
 }
