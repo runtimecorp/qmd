@@ -16,9 +16,12 @@ import type { Database } from "./db.js";
 import picomatch from "picomatch";
 import { createHash } from "crypto";
 import { realpathSync, statSync, mkdirSync } from "node:fs";
+import { encoding_for_model } from "tiktoken";
 import {
   LlamaCpp,
+  getDefaultEmbeddingLLM,
   getDefaultLlamaCpp,
+  isUsingOpenAI,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   type RerankDocument,
@@ -1427,7 +1430,10 @@ export async function chunkDocumentByTokens(
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
   windowTokens: number = CHUNK_WINDOW_TOKENS
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  const llm = getDefaultLlamaCpp();
+  // Use tiktoken for OpenAI (fast, no local model loading)
+  if (isUsingOpenAI()) {
+    return chunkWithTiktoken(content, maxTokens, overlapTokens);
+  }
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
@@ -1435,6 +1441,8 @@ export async function chunkDocumentByTokens(
   const maxChars = maxTokens * avgCharsPerToken;
   const overlapChars = overlapTokens * avgCharsPerToken;
   const windowChars = windowTokens * avgCharsPerToken;
+
+  const llm = getDefaultLlamaCpp();
 
   // Chunk in character space with conservative estimate
   let charChunks = chunkDocument(content, maxChars, overlapChars, windowChars);
@@ -1448,10 +1456,8 @@ export async function chunkDocumentByTokens(
     if (tokens.length <= maxTokens) {
       results.push({ text: chunk.text, pos: chunk.pos, tokens: tokens.length });
     } else {
-      // Chunk is still too large - split it further
-      // Use actual token count to estimate better char limit
       const actualCharsPerToken = chunk.text.length / tokens.length;
-      const safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95); // 5% safety margin
+      const safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95);
 
       const subChunks = chunkDocument(chunk.text, safeMaxChars, Math.floor(overlapChars * actualCharsPerToken / 2), Math.floor(windowChars * actualCharsPerToken / 2));
 
@@ -1467,6 +1473,87 @@ export async function chunkDocumentByTokens(
   }
 
   return results;
+}
+
+let tiktokenEncoder: ReturnType<typeof encoding_for_model> | null = null;
+
+function getTiktokenEncoder() {
+  if (!tiktokenEncoder) {
+    // text-embedding-3-small uses cl100k_base
+    tiktokenEncoder = encoding_for_model("gpt-4");
+  }
+  return tiktokenEncoder;
+}
+
+function chunkWithTiktoken(
+  content: string,
+  maxTokens: number,
+  overlapTokens: number
+): { text: string; pos: number; tokens: number }[] {
+  const encoder = getTiktokenEncoder();
+  const allTokens = encoder.encode(content, "all");
+  const totalTokens = allTokens.length;
+
+  if (totalTokens <= maxTokens) {
+    return [{ text: content, pos: 0, tokens: totalTokens }];
+  }
+
+  const chunks: { text: string; pos: number; tokens: number }[] = [];
+  const step = maxTokens - overlapTokens;
+  const decoder = new TextDecoder();
+  let tokenPos = 0;
+  const avgCharsPerToken = content.length / totalTokens;
+
+  while (tokenPos < totalTokens) {
+    const chunkEnd = Math.min(tokenPos + maxTokens, totalTokens);
+    const chunkTokens = allTokens.slice(tokenPos, chunkEnd);
+    let chunkText = decoder.decode(encoder.decode(chunkTokens));
+
+    if (chunkEnd < totalTokens) {
+      chunkText = findGoodBreakPoint(chunkText);
+    }
+
+    const charPos = Math.floor(tokenPos * avgCharsPerToken);
+    chunks.push({ text: chunkText, pos: charPos, tokens: chunkTokens.length });
+
+    if (chunkEnd >= totalTokens) break;
+    tokenPos += step;
+  }
+
+  return chunks;
+}
+
+function findGoodBreakPoint(text: string): string {
+  const searchStart = Math.floor(text.length * 0.7);
+  const searchSlice = text.slice(searchStart);
+
+  let breakOffset = -1;
+  const paragraphBreak = searchSlice.lastIndexOf("\n\n");
+  if (paragraphBreak >= 0) {
+    breakOffset = paragraphBreak + 2;
+  } else {
+    const sentenceEnd = Math.max(
+      searchSlice.lastIndexOf(". "),
+      searchSlice.lastIndexOf(".\n"),
+      searchSlice.lastIndexOf("? "),
+      searchSlice.lastIndexOf("?\n"),
+      searchSlice.lastIndexOf("! "),
+      searchSlice.lastIndexOf("!\n")
+    );
+    if (sentenceEnd >= 0) {
+      breakOffset = sentenceEnd + 2;
+    } else {
+      const lineBreak = searchSlice.lastIndexOf("\n");
+      if (lineBreak >= 0) {
+        breakOffset = lineBreak + 1;
+      }
+    }
+  }
+
+  if (breakOffset >= 0) {
+    return text.slice(0, searchStart + breakOffset);
+  }
+  return text;
 }
 
 // =============================================================================
@@ -2243,6 +2330,14 @@ export async function searchVec(db: Database, query: string, model: string, limi
 async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text) : formatDocForEmbedding(text);
+
+  // Always use OpenAI when configured (avoid loading local models)
+  if (isUsingOpenAI()) {
+    const llm = getDefaultEmbeddingLLM();
+    const result = await llm.embed(formattedText, { model, isQuery });
+    return result?.embedding || null;
+  }
+
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
     : await getDefaultLlamaCpp().embed(formattedText, { model, isQuery });
@@ -2300,7 +2395,11 @@ export function insertEmbedding(
 
 export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types
-  const cacheKey = getCacheKey("expandQuery", { query, model });
+  const cacheKey = getCacheKey("expandQuery", {
+    query,
+    model,
+    provider: isUsingOpenAI() ? "openai" : "local",
+  });
   const cached = getCachedResult(db, cacheKey);
   if (cached) {
     try {
@@ -2310,7 +2409,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  const llm = getDefaultLlamaCpp();
+  const llm = isUsingOpenAI() ? getDefaultEmbeddingLLM() : getDefaultLlamaCpp();
   // Note: LlamaCpp uses hardcoded model, model parameter is ignored
   const results = await llm.expandQuery(query);
 
@@ -2350,7 +2449,7 @@ export async function rerank(query: string, documents: { file: string; text: str
 
   // Rerank uncached documents using LlamaCpp
   if (uncachedDocs.length > 0) {
-    const llm = getDefaultLlamaCpp();
+    const llm = isUsingOpenAI() ? getDefaultEmbeddingLLM() : getDefaultLlamaCpp();
     const rerankResult = await llm.rerank(query, uncachedDocs, { model });
 
     // Cache results — use original doc.text for cache key (result.file lacks chunk text)
